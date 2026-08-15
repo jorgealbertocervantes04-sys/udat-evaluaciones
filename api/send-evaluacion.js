@@ -6,11 +6,11 @@ export default async function handler(req, res) {
   // Capturas los datos enviados desde tus componentes de React
   const datosEvaluacion = req.body; 
 
-  const appId = process.env.APPSHEET_APP_ID;
-  const accessKey = process.env.APPSHEET_ACCESS_KEY;
+  const appId = process.env['project-d63299ea-3cc8-4966-9d5'];
+  const accessKey = process.env['Tazzyta98'];
 
   try {
-    const response = await fetch(`https://appsheet.com{appId}/tables/NombreDeTuTabla/Add`, {
+    const response = await fetch(`https://appsheet.com/${appId}/tables/NombreDeTuTabla/Add`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
