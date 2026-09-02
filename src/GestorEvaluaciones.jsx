@@ -112,7 +112,7 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [sincronizando, setSincronizando] = useState(false);
   const [listaMentores, setListaMentores] = useState([]);
-  const [enviandoData, setEnviandoData] = useState(false); // Para mostrar que está enviando
+  const [enviandoData, setEnviandoData] = useState(false);
   
   // ESTADOS DE EVALUACIÓN
   const [mentorId, setMentorId] = useState('');
@@ -142,7 +142,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
     return () => { window.removeEventListener('online', handleOnline); window.removeEventListener('offline', handleOffline); };
   }, []);
 
-  // Al cambiar la pestaña (Aula -> Maniobras), se reinicia el formulario
   useEffect(() => { 
     setRespuestasChecklist({}); 
     setCompromisoFortaleza('');
@@ -151,7 +150,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
     if (firmaEvaluadorRef.current) firmaEvaluadorRef.current.clear();
   }, [tipoEvaluacion]);
 
-  // FUNCIONES DE LIMPIEZA BLINDADAS
   const limpiarFirmaMentor = () => {
     if (firmaMentorRef.current) firmaMentorRef.current.clear();
   };
@@ -169,29 +167,59 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
     limpiarFirmaEvaluador();
   };
 
-  // TRANSMISIÓN (CONECTADA A TU SUPABASE ORIGINAL CON ALERTA DE ERROR)
-  const procesarEvaluacion = async (datosFormulario) => {
+  // Traduce el valor del botón (1 / 0.5 / 0) a las columnas reales de resultados_criterios
+  const mapearCriteriosParaGuardar = (criteriosDetalle) => {
+    return criteriosDetalle.map((c) => ({
+      categoria: c.categoria,
+      criterio_evaluado: c.texto,
+      nivel_riesgo: c.riesgo,
+      cumple: c.valor === 1,
+      observaciones: c.valor === 1 ? 'Cumple (100%)' : c.valor === 0.5 ? 'Cumplimiento parcial (50%)' : 'No cumple (0%)'
+    }));
+  };
+
+  // TRANSMISIÓN: ahora inserta evaluación + todos los criterios individuales
+  const procesarEvaluacion = async (datosFormulario, criteriosDetalle) => {
     setEnviandoData(true);
     if (isOnline) {
-      const { error } = await supabase.from('evaluaciones').insert([datosFormulario]);
+      const { data: evaluacionInsertada, error: errorEvaluacion } = await supabase
+        .from('evaluaciones')
+        .insert([datosFormulario])
+        .select('id')
+        .single();
+
+      if (errorEvaluacion) {
+        setEnviandoData(false);
+        console.error("Falla Supabase (evaluaciones):", errorEvaluacion);
+        alert(`❌ ERROR DE BASE DE DATOS:\n\n${errorEvaluacion.message}\n\nDetalles: ${errorEvaluacion.details}\n\nPor favor envíame captura de este cuadro rojo.`);
+        return;
+      }
+
+      const filasCriterios = mapearCriteriosParaGuardar(criteriosDetalle).map((c) => ({
+        ...c,
+        evaluacion_id: evaluacionInsertada.id
+      }));
+
+      const { error: errorCriterios } = await supabase.from('resultados_criterios').insert(filasCriterios);
+
       setEnviandoData(false);
-      
-      if (error) {
-        console.error("Falla Supabase:", error);
-        alert(`❌ ERROR DE BASE DE DATOS:\n\n${error.message}\n\nDetalles: ${error.details}\n\nPor favor envíame captura de este cuadro rojo.`);
+
+      if (errorCriterios) {
+        console.error("Falla Supabase (resultados_criterios):", errorCriterios);
+        alert(`⚠️ La evaluación se guardó (ID ${evaluacionInsertada.id}), pero los criterios detallados fallaron:\n\n${errorCriterios.message}\n\nPor favor envíame captura de este cuadro.`);
       } else {
-        alert(`✅ Evaluación de ${tipoEvaluacion} sellada y enviada a la base de datos con éxito.`);
+        alert(`✅ Evaluación de ${tipoEvaluacion} sellada y enviada a la base de datos con éxito (${filasCriterios.length} criterios guardados).`);
         limpiarFormulario();
       }
     } else {
-      guardarLocal(datosFormulario);
+      guardarLocal(datosFormulario, criteriosDetalle);
       setEnviandoData(false);
     }
   };
 
-  const guardarLocal = (datosFormulario) => {
+  const guardarLocal = (datosFormulario, criteriosDetalle) => {
     const pendientes = JSON.parse(localStorage.getItem('evaluaciones_offline')) || [];
-    pendientes.push(datosFormulario);
+    pendientes.push({ datosFormulario, criteriosDetalle });
     localStorage.setItem('evaluaciones_offline', JSON.stringify(pendientes));
     alert("Modo offline: No hay internet. La evaluación se guardó en la tablet.");
     limpiarFormulario();
@@ -201,15 +229,47 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
     const pendientes = JSON.parse(localStorage.getItem('evaluaciones_offline')) || [];
     if (pendientes.length === 0) return;
     setSincronizando(true);
-    const { error } = await supabase.from('evaluaciones').insert(pendientes);
-    if (!error) {
-      localStorage.removeItem('evaluaciones_offline');
-      alert(`Sincronización exitosa: ${pendientes.length} bitácoras enviadas a la nube.`);
+
+    const pendientesFallidos = [];
+    let enviadosOk = 0;
+
+    for (const item of pendientes) {
+      const { datosFormulario, criteriosDetalle } = item;
+
+      const { data: evaluacionInsertada, error: errorEvaluacion } = await supabase
+        .from('evaluaciones')
+        .insert([datosFormulario])
+        .select('id')
+        .single();
+
+      if (errorEvaluacion) {
+        pendientesFallidos.push(item);
+        continue;
+      }
+
+      const filasCriterios = mapearCriteriosParaGuardar(criteriosDetalle || []).map((c) => ({
+        ...c,
+        evaluacion_id: evaluacionInsertada.id
+      }));
+
+      if (filasCriterios.length > 0) {
+        const { error: errorCriterios } = await supabase.from('resultados_criterios').insert(filasCriterios);
+        if (errorCriterios) {
+          console.error("Falla al sincronizar criterios de evaluación offline:", errorCriterios);
+        }
+      }
+
+      enviadosOk++;
     }
+
+    localStorage.setItem('evaluaciones_offline', JSON.stringify(pendientesFallidos));
     setSincronizando(false);
+
+    if (enviadosOk > 0) {
+      alert(`Sincronización: ${enviadosOk} bitácoras enviadas a la nube.${pendientesFallidos.length > 0 ? ` ${pendientesFallidos.length} quedaron pendientes por error.` : ''}`);
+    }
   };
 
-  // DATOS DINÁMICOS DEPENDIENDO DEL SELECT
   const criteriosAMostrar = tipoEvaluacion === 'Aula' ? criteriosAula : tipoEvaluacion === 'Maniobras' ? criteriosManiobras : criteriosConduccion;
 
   const criteriosAgrupados = criteriosAMostrar.reduce((acc, obj) => {
@@ -240,7 +300,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
 
   const { total, contestadas, calificacion } = calcularCalificacionGlobal();
 
-  // TELEMETRÍA POR CATEGORÍA
   const obtenerProgresoCategoria = (categoria) => {
     const preguntasCat = criteriosAgrupados[categoria];
     let ptos = 0, cont = 0;
@@ -254,7 +313,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
     return { pct, completo: cont === preguntasCat.length };
   };
 
-  // MOTOR DE RETROALIMENTACIÓN AUTOMÁTICA
   const generarFeedbackVisual = () => {
     const fortalezas = criteriosAMostrar.filter(c => respuestasChecklist[c.id] === 1);
     const debilidades = criteriosAMostrar.filter(c => respuestasChecklist[c.id] === 0 || respuestasChecklist[c.id] === 0.5);
@@ -266,7 +324,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
   const handleSubmit = (e) => {
     e.preventDefault();
     
-    // NUEVO SISTEMA DE AVISO: Te dice exactamente si te faltan preguntas.
     if (contestadas < total) {
       alert(`⚠️ OPERACIÓN DENEGADA:\n\nDe los ${total} criterios de la etapa de ${tipoEvaluacion}, solo has contestado ${contestadas}.\n\nTe faltan evaluar ${total - contestadas} rubros. Revisa la lista por favor.`);
       return;
@@ -280,7 +337,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
       return;
     }
 
-    // MAPEO A LAS COLUMNAS EXACTAS DE TU SUPABASE ORIGINAL
     const datosEvaluacion = {
       evaluador_email: evaluadorEmail || 'usuario@udat.com',
       mentor_id: mentorId || null,
@@ -297,23 +353,29 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
       percepcion_alumno_seguridad: 'Pendiente de QR',
       firma_mentor_url: firmaMentorRef.current.getCanvas().toDataURL('image/png'),
       firma_evaluador_url: firmaEvaluadorRef.current.getCanvas().toDataURL('image/png'),
-      fecha_evaluacion: new Date().toISOString()
+      fecha_evaluacion: new Date().toISOString(),
+      evaluacion_id_qr: evaluacionId
     };
+
+    const criteriosDetalle = criteriosAMostrar.map((c) => ({
+      categoria: c.categoria,
+      texto: c.texto,
+      riesgo: c.riesgo,
+      valor: respuestasChecklist[c.id]
+    }));
     
-    procesarEvaluacion(datosEvaluacion);
+    procesarEvaluacion(datosEvaluacion, criteriosDetalle);
   };
 
   return (
     <div className="p-4 max-w-6xl mx-auto font-sans pb-20 bg-slate-50 min-h-screen">
       
-      {/* 🔴 HEADER CONEXIÓN */}
       <div className={`p-4 text-center text-white font-black uppercase tracking-widest mb-6 rounded-xl shadow-lg transition-colors duration-500 ${isOnline ? 'bg-gradient-to-r from-emerald-600 to-emerald-500' : 'bg-gradient-to-r from-red-600 to-red-500'}`}>
         {isOnline ? '🟢 Telemetría Activa - Nube Conectada' : '🔴 Modo Offline - Guardado Local'}
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-10">
         
-        {/* 📋 SECCIÓN 1: OPERACIÓN */}
         <div className="bg-white p-8 rounded-2xl shadow-sm border border-slate-200">
             <h2 className="text-xl font-black text-slate-800 uppercase tracking-wider flex items-center border-b pb-4 mb-6">
               <span className="bg-slate-900 text-white rounded-lg w-8 h-8 inline-flex items-center justify-center mr-3">1</span>
@@ -338,7 +400,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
             </div>
         </div>
 
-        {/* ✅ SECCIÓN 2: CHECKLIST CON TELEMETRÍA */}
         <div className="bg-white p-8 rounded-2xl shadow-sm border border-slate-200">
           <div className="flex flex-col lg:flex-row lg:items-center justify-between mb-8 border-b pb-4">
             <h2 className="text-xl font-black text-slate-800 uppercase tracking-wider flex items-center mb-4 lg:mb-0">
@@ -355,8 +416,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
               const { pct, completo } = obtenerProgresoCategoria(categoria);
               return (
                 <div key={catIndex} className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
-                  
-                  {/* Cabecera con Barra de Progreso Dinámica */}
                   <div className="bg-slate-50 p-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                     <h3 className="font-bold text-slate-800 text-sm uppercase tracking-wider">{categoria}</h3>
                     <div className="flex items-center gap-3 w-full sm:w-1/3">
@@ -370,7 +429,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
                   <div className="p-3 space-y-3">
                     {criteriosAgrupados[categoria].map((criterio, index) => (
                       <div key={criterio.id} className={`flex flex-col xl:flex-row items-start xl:items-center justify-between p-4 rounded-xl transition-all border ${respuestasChecklist[criterio.id] !== undefined ? 'bg-slate-50 border-slate-200 opacity-75' : 'bg-white border-blue-100 shadow-sm'}`}>
-                        
                         <div className="flex-1 pr-4 mb-4 xl:mb-0 w-full">
                           <div className="flex items-center gap-2 mb-2">
                             <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-widest text-white shadow-sm ${criterio.color === 'red' ? 'bg-red-500' : criterio.color === 'yellow' ? 'bg-amber-500 text-amber-900' : 'bg-emerald-500'}`}>
@@ -395,7 +453,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
           </div>
         </div>
 
-        {/* 🚀 SECCIÓN 3: DASHBOARD DE MEJORA CONTINUA (AUTOGENERADO) */}
         {contestadas === total && total > 0 && (
           <div className="bg-gradient-to-br from-slate-900 to-slate-800 p-8 rounded-2xl shadow-xl border border-slate-700 text-white animate-fade-in-up">
             <h2 className="text-xl font-black uppercase tracking-wider flex items-center border-b border-slate-700 pb-4 mb-6">
@@ -404,7 +461,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
             </h2>
             
             <div className="grid lg:grid-cols-2 gap-8 mb-8">
-              {/* Fortalezas (Verdes) */}
               <div className="bg-slate-800 p-5 rounded-xl border border-emerald-900/50">
                 <h3 className="text-emerald-400 font-bold mb-3 flex items-center gap-2"><span className="text-xl">⭐</span> Top Fortalezas Detectadas</h3>
                 <ul className="space-y-2 text-sm text-slate-300">
@@ -412,7 +468,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
                 </ul>
               </div>
               
-              {/* Áreas Críticas (Rojos y Amarillos) */}
               <div className="bg-slate-800 p-5 rounded-xl border border-red-900/50">
                 <h3 className="text-red-400 font-bold mb-3 flex items-center gap-2"><span className="text-xl">⚠️</span> Áreas Críticas a Corregir</h3>
                 <ul className="space-y-2 text-sm text-slate-300">
@@ -421,7 +476,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
               </div>
             </div>
 
-            {/* Plan SMART */}
             <div className="bg-slate-50 p-6 rounded-xl text-slate-800 shadow-inner">
               <h3 className="font-black text-slate-800 mb-4 uppercase tracking-widest text-sm">Acuerdo de Mejora Continua (Obligatorio)</h3>
               
@@ -439,7 +493,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
           </div>
         )}
 
-        {/* 📱 SECCIÓN 4: ENCUESTA QR */}
         <div className="bg-white p-8 rounded-2xl shadow-sm border border-slate-200">
           <h2 className="text-xl font-black text-slate-800 uppercase tracking-wider flex items-center border-b pb-4 mb-6">
             <span className="bg-slate-900 text-white rounded-lg w-8 h-8 inline-flex items-center justify-center mr-3">4</span>
@@ -463,7 +516,6 @@ export default function GestorEvaluaciones({ evaluadorEmail }) {
           )}
         </div>
 
-        {/* ✍️ SECCIÓN 5: FIRMAS */}
         <div className="bg-white p-8 rounded-2xl shadow-sm border border-slate-200">
             <h2 className="text-xl font-black text-slate-800 uppercase tracking-wider flex items-center border-b pb-4 mb-6">
               <span className="bg-slate-900 text-white rounded-lg w-8 h-8 inline-flex items-center justify-center mr-3">5</span>
